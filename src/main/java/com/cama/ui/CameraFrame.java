@@ -1,29 +1,43 @@
 package com.cama.ui;
 
+import com.cama.recorder.AudioRecorder;
+import com.cama.recorder.FfmpegMuxer;
 import com.cama.recorder.FrameScaler;
 import com.cama.recorder.VideoRecorder;
 import com.github.sarxos.webcam.Webcam;
 
+import javax.swing.AbstractAction;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
-import javax.swing.JButton;
+import javax.swing.BoxLayout;
 import javax.swing.JComboBox;
+import javax.swing.JComponent;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JToolBar;
+import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Desktop;
 import java.awt.Dimension;
+import java.awt.FlowLayout;
 import java.awt.Font;
+import java.awt.Graphics;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.event.ActionEvent;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.awt.image.BufferedImage;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -39,16 +53,21 @@ public class CameraFrame extends JFrame {
             "1280 x 720", "960 x 540", "640 x 480", "320 x 240"
     };
 
-    private final JComboBox<String> deviceCombo = new JComboBox<String>();
-    private final JComboBox<String> resolutionCombo = new JComboBox<String>(RESOLUTION_OPTIONS);
-    private final JComboBox<String> fpsCombo = new JComboBox<String>(FPS_OPTIONS);
-    private final JButton refreshButton = new JButton("刷新");
-    private final JButton recordButton = new JButton("● 开始录像");
-    private final JButton folderButton = new JButton("录像目录");
-    private final JLabel recLabel = new JLabel(" ");
-    private final JLabel statusLabel = new JLabel("就绪");
+    private final JComboBox<String> deviceCombo = Theme.combo(new String[0]);
+    private final JComboBox<String> resolutionCombo = Theme.combo(RESOLUTION_OPTIONS);
+    private final JComboBox<String> fpsCombo = Theme.combo(FPS_OPTIONS);
+    private final JComboBox<String> micCombo = Theme.combo(new String[0]);
+    private final PillButton refreshButton = PillButton.ghost("刷新");
+    private final PillButton recordButton = PillButton.accent("● 开始录像");
+    private final PillButton folderButton = PillButton.ghost("打开录像目录");
+    private final JLabel statusLabel = Theme.label("就绪", Theme.BASE.deriveFont(12f),
+            Theme.MUTED);
+    private final JLabel infoLabel = Theme.label("", Theme.BASE.deriveFont(Font.PLAIN, 12f),
+            Theme.FAINT);
     private final PreviewPanel preview = new PreviewPanel();
     private final VideoRecorder recorder = new VideoRecorder();
+    private final AudioRecorder audioRecorder = new AudioRecorder();
+    private final List<AudioRecorder.Device> micDevices = new ArrayList<AudioRecorder.Device>();
     private final File recordingsDir;
 
     private List<Webcam> webcams = new ArrayList<Webcam>();
@@ -63,27 +82,38 @@ public class CameraFrame extends JFrame {
     private FrameScaler previewScaler;
     private Timer recTimer;
     private boolean updatingUi;
+    private boolean recordingActive;
+    private boolean recordError;
+    private boolean finalizing;
+    private File pendingOutputFile;
+    private File pendingVideoFile;
+    private File pendingAudioFile;
+    private long pendingAudioLeadMillis;
 
     public CameraFrame() {
-        super("CAMA 摄像头录像");
+        super("CAMA · 摄像头录像");
         this.recordingsDir = new File(System.getProperty("user.dir"), "recordings");
         if (!recordingsDir.exists()) {
             recordingsDir.mkdirs();
         }
 
         setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
-        setSize(980, 720);
-        setMinimumSize(new Dimension(720, 520));
+        setSize(1080, 780);
+        setMinimumSize(new Dimension(780, 580));
         setLocationRelativeTo(null);
+        getContentPane().setBackground(Theme.BG);
         setLayout(new BorderLayout());
+        add(createHeader(), BorderLayout.NORTH);
+        add(createCenter(), BorderLayout.CENTER);
+        add(createFooter(), BorderLayout.SOUTH);
 
-        add(createToolBar(), BorderLayout.NORTH);
-        add(preview, BorderLayout.CENTER);
-        add(createStatusBar(), BorderLayout.SOUTH);
-
-        deviceCombo.setPreferredSize(new Dimension(240, deviceCombo.getPreferredSize().height));
-        resolutionCombo.setPreferredSize(new Dimension(120, resolutionCombo.getPreferredSize().height));
-        fpsCombo.setPreferredSize(new Dimension(70, fpsCombo.getPreferredSize().height));
+        Theme.sizeCombo(deviceCombo, 280, 34);
+        Theme.sizeCombo(resolutionCombo, 160, 34);
+        Theme.sizeCombo(fpsCombo, 96, 34);
+        Theme.sizeCombo(micCombo, 190, 34);
+        micCombo.setToolTipText("录像时使用的麦克风，停止后由 FFmpeg 合成为 AAC 音轨");
+        recordButton.setButtonHeight(38);
+        recordButton.setToolTipText("开始 / 停止录像（Ctrl+R）");
         resolutionCombo.setSelectedItem("640 x 480");
         fpsCombo.setSelectedItem("20");
         recordButton.setEnabled(false);
@@ -96,11 +126,31 @@ public class CameraFrame extends JFrame {
         resolutionCombo.addActionListener(e -> {
             if (!updatingUi && !recorder.isRecording()) {
                 fpsCombo.setSelectedItem(String.valueOf(recommendedFps()));
+                updateInfo();
+            }
+        });
+        fpsCombo.addActionListener(e -> {
+            if (!updatingUi) {
+                updateInfo();
             }
         });
         refreshButton.addActionListener(e -> refreshDevices());
         recordButton.addActionListener(e -> toggleRecording());
         folderButton.addActionListener(e -> openRecordingsFolder());
+
+        getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(
+                KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_DOWN_MASK),
+                "toggleRecord");
+        getRootPane().getActionMap().put("toggleRecord", new AbstractAction() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (recordButton.isEnabled()) {
+                    toggleRecording();
+                }
+            }
+        });
 
         addWindowListener(new WindowAdapter() {
             @Override
@@ -112,49 +162,119 @@ public class CameraFrame extends JFrame {
         refreshDevices();
     }
 
-    private JToolBar createToolBar() {
-        JToolBar bar = new JToolBar();
-        bar.setFloatable(false);
-        bar.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
+    private JPanel createHeader() {
+        JPanel header = new JPanel(new BorderLayout(20, 0));
+        header.setBackground(Theme.SURFACE);
+        header.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.BORDER),
+                BorderFactory.createEmptyBorder(12, 20, 12, 20)));
 
-        bar.add(new JLabel("摄像头: "));
-        bar.add(deviceCombo);
-        bar.add(refreshButton);
-        bar.addSeparator();
-        bar.add(new JLabel("输出分辨率: "));
-        bar.add(resolutionCombo);
-        bar.addSeparator();
-        bar.add(new JLabel("帧率: "));
-        bar.add(fpsCombo);
-        bar.addSeparator();
-        bar.add(recordButton);
-        bar.add(folderButton);
-        bar.add(Box.createHorizontalGlue());
+        JPanel brand = new JPanel();
+        brand.setOpaque(false);
+        brand.setLayout(new BoxLayout(brand, BoxLayout.X_AXIS));
 
-        recLabel.setFont(recLabel.getFont().deriveFont(Font.BOLD, 14f));
-        recLabel.setForeground(Color.RED);
-        bar.add(recLabel);
-        return bar;
+        JComponent mark = new JComponent() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                        RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(Theme.ACCENT);
+                g2.fillRoundRect(0, 0, 28, 28, 9, 9);
+                g2.setColor(Color.WHITE);
+                g2.fillOval(10, 10, 8, 8);
+                g2.dispose();
+            }
+        };
+        mark.setOpaque(false);
+        mark.setPreferredSize(new Dimension(28, 28));
+        mark.setMinimumSize(new Dimension(28, 28));
+        mark.setMaximumSize(new Dimension(28, 28));
+
+        JPanel titles = new JPanel();
+        titles.setOpaque(false);
+        titles.setLayout(new BoxLayout(titles, BoxLayout.Y_AXIS));
+        JLabel title = Theme.label("CAMA", Theme.TITLE, Theme.TEXT);
+        JLabel subtitle = Theme.label("摄像头录像", Theme.BASE.deriveFont(11f), Theme.MUTED);
+        title.setAlignmentX(Component.LEFT_ALIGNMENT);
+        subtitle.setAlignmentX(Component.LEFT_ALIGNMENT);
+        titles.add(title);
+        titles.add(Box.createVerticalStrut(1));
+        titles.add(subtitle);
+        titles.setAlignmentY(Component.CENTER_ALIGNMENT);
+
+        brand.add(mark);
+        brand.add(Box.createHorizontalStrut(11));
+        brand.add(titles);
+
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        controls.setOpaque(false);
+        controls.add(Theme.label("摄像头", Theme.BASE, Theme.MUTED));
+        controls.add(deviceCombo);
+        controls.add(refreshButton);
+
+        header.add(brand, BorderLayout.WEST);
+        header.add(controls, BorderLayout.EAST);
+        return header;
     }
 
-    private JPanel createStatusBar() {
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setBorder(BorderFactory.createEmptyBorder(4, 10, 6, 10));
-        panel.add(statusLabel, BorderLayout.WEST);
-        return panel;
+    private JPanel createCenter() {
+        JPanel center = new JPanel(new BorderLayout());
+        center.setBackground(Theme.BG);
+        center.setBorder(BorderFactory.createEmptyBorder(16, 16, 16, 16));
+        center.add(preview, BorderLayout.CENTER);
+        return center;
+    }
+
+    private JPanel createFooter() {
+        JPanel footer = new JPanel(new BorderLayout(0, 9));
+        footer.setBackground(Theme.SURFACE);
+        footer.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.BORDER),
+                BorderFactory.createEmptyBorder(13, 20, 11, 20)));
+
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 9, 0));
+        row.setOpaque(false);
+        row.add(recordButton);
+        row.add(Box.createHorizontalStrut(8));
+        row.add(Theme.divider());
+        row.add(Box.createHorizontalStrut(3));
+        row.add(Theme.label("输出分辨率", Theme.BASE, Theme.MUTED));
+        row.add(resolutionCombo);
+        row.add(Theme.label("帧率", Theme.BASE, Theme.MUTED));
+        row.add(fpsCombo);
+        row.add(Theme.divider());
+        row.add(Theme.label("麦克风", Theme.BASE, Theme.MUTED));
+        row.add(micCombo);
+        row.add(Theme.divider());
+        row.add(folderButton);
+
+        JPanel statusRow = new JPanel(new BorderLayout());
+        statusRow.setOpaque(false);
+        statusRow.add(statusLabel, BorderLayout.WEST);
+        statusRow.add(infoLabel, BorderLayout.EAST);
+
+        footer.add(row, BorderLayout.CENTER);
+        footer.add(statusRow, BorderLayout.SOUTH);
+        return footer;
     }
 
     private void refreshDevices() {
-        if (recorder.isRecording()) {
+        if (recordingActive || finalizing) {
             return;
         }
         updatingUi = true;
         try {
+            refreshAudioDevices();
             stopCapture();
             if (webcam != null) {
                 webcam.close();
                 webcam = null;
             }
+            preview.setImage(null);
+            preview.setSourceLabel("");
             webcams = Webcam.getWebcams();
             deviceCombo.removeAllItems();
             for (Webcam cam : webcams) {
@@ -163,6 +283,7 @@ public class CameraFrame extends JFrame {
             if (webcams.isEmpty()) {
                 recordButton.setEnabled(false);
                 statusLabel.setText("未检测到摄像头，请检查设备连接与 Windows 隐私设置");
+                updateInfo();
                 return;
             }
             deviceCombo.setSelectedIndex(0);
@@ -174,6 +295,57 @@ public class CameraFrame extends JFrame {
         openCamera(0);
     }
 
+    /** 重新枚举麦克风。没有 ffmpeg 时音频不可用，只能录制视频。 */
+    private void refreshAudioDevices() {
+        String previous = (String) micCombo.getSelectedItem();
+        micDevices.clear();
+        micCombo.removeAllItems();
+        micCombo.addItem("不录制音频");
+        micCombo.addItem("默认麦克风");
+        try {
+            for (AudioRecorder.Device device : AudioRecorder.listDevices()) {
+                micDevices.add(device);
+                micCombo.addItem(device.getName());
+            }
+        } catch (Exception ignored) {
+            // 没有可用的录音设备时保底只提供「默认麦克风」
+        }
+        boolean ffmpegReady = FfmpegMuxer.isAvailable();
+        micCombo.setEnabled(ffmpegReady);
+        if (!ffmpegReady) {
+            micCombo.setSelectedIndex(0);
+            return;
+        }
+        if (previous == null || !selectComboItem(previous)) {
+            micCombo.setSelectedIndex(1);
+        }
+    }
+
+    private boolean selectComboItem(String value) {
+        for (int i = 0; i < micCombo.getItemCount(); i++) {
+            if (value.equals(micCombo.getItemAt(i))) {
+                micCombo.setSelectedIndex(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 当前选中的麦克风；返回 null 表示不录音。 */
+    private AudioRecorder.Device selectedMicDevice() {
+        int index = micCombo.getSelectedIndex();
+        if (index == 1) {
+            return AudioRecorder.defaultDevice();
+        }
+        if (index >= 2) {
+            int deviceIndex = index - 2;
+            if (deviceIndex < micDevices.size()) {
+                return micDevices.get(deviceIndex);
+            }
+        }
+        return null;
+    }
+
     private void openCamera(int index) {
         stopRecording();
         stopCapture();
@@ -183,6 +355,9 @@ public class CameraFrame extends JFrame {
         }
         if (index < 0 || index >= webcams.size()) {
             recordButton.setEnabled(false);
+            preview.setSourceLabel("");
+            preview.setImage(null);
+            updateInfo();
             return;
         }
         Webcam cam = webcams.get(index);
@@ -211,6 +386,9 @@ public class CameraFrame extends JFrame {
         if (!opened) {
             recordButton.setEnabled(false);
             statusLabel.setText("无法打开摄像头: " + cam.getName());
+            preview.setSourceLabel("");
+            preview.setImage(null);
+            updateInfo();
             return;
         }
         webcam = cam;
@@ -225,9 +403,11 @@ public class CameraFrame extends JFrame {
         } else {
             previewScaler = new FrameScaler(actual.width, actual.height);
         }
-        statusLabel.setText("已就绪  |  " + cam.getName() + "  采集画面 "
-                + actual.width + "x" + actual.height);
-        recordButton.setEnabled(true);
+        preview.setSourceLabel(cam.getName());
+        updateInfo();
+        statusLabel.setText("已就绪  |  " + cam.getName()
+                + (FfmpegMuxer.isAvailable() ? "" : "  ·  未找到 ffmpeg，本次只能录制视频"));
+        recordButton.setEnabled(!finalizing);
         startCapture();
     }
 
@@ -416,15 +596,35 @@ public class CameraFrame extends JFrame {
         return new Dimension(640, 480);
     }
 
+    private void updateInfo() {
+        Dimension out = selectedResolution();
+        StringBuilder text = new StringBuilder();
+        if (webcam != null) {
+            Dimension src = webcam.getViewSize();
+            if (src != null) {
+                text.append("采集 ").append(src.width).append("×").append(src.height)
+                        .append("    ·    ");
+            }
+        }
+        text.append("输出 ").append(out.width).append("×").append(out.height)
+                .append(" @ ").append(selectedFps()).append(" fps");
+        infoLabel.setText(text.toString());
+        preview.setOutputLabel("输出 " + out.width + "×" + out.height
+                + " · " + selectedFps() + " fps");
+    }
+
     private void toggleRecording() {
-        if (recorder.isRecording()) {
+        if (recordingActive) {
             stopRecording();
-        } else {
+        } else if (!finalizing) {
             startRecording();
         }
     }
 
     private void startRecording() {
+        if (recordingActive || finalizing) {
+            return;
+        }
         if (webcam == null || !webcam.isOpen()) {
             JOptionPane.showMessageDialog(this, "摄像头未就绪，无法录像。",
                     "提示", JOptionPane.WARNING_MESSAGE);
@@ -432,70 +632,290 @@ public class CameraFrame extends JFrame {
         }
         Dimension res = selectedResolution();
         scaler = new FrameScaler(res.width, res.height);
-        String name = "CAMA_" + new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date()) + ".mp4";
-        File output = new File(recordingsDir, name);
+
+        String baseName = "CAMA_" + new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+        File output = new File(recordingsDir, baseName + ".mp4");
+        File tmpDir = new File(recordingsDir, ".tmp");
+        if (!tmpDir.exists() && !tmpDir.mkdirs()) {
+            JOptionPane.showMessageDialog(this, "无法创建临时目录: " + tmpDir.getAbsolutePath(),
+                    "错误", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        cleanTempDir(tmpDir);
+        File videoTmp = new File(tmpDir, baseName + ".video.mp4");
+        File audioTmp = new File(tmpDir, baseName + ".audio.wav");
+
+        // 音频先于视频开始采集，停止时再把多出来的开头裁掉，避免音画不同步
+        AudioRecorder.Device mic = selectedMicDevice();
+        boolean audioStarted = false;
+        String notice = null;
+        if (mic != null) {
+            if (FfmpegMuxer.isAvailable()) {
+                try {
+                    audioRecorder.start(audioTmp, mic);
+                    audioStarted = true;
+                } catch (Exception ex) {
+                    notice = "麦克风不可用，本次仅录制视频";
+                }
+            } else {
+                notice = "未找到 ffmpeg，本次仅录制视频";
+            }
+        }
+
         try {
-            recorder.start(output, selectedFps());
+            recorder.start(videoTmp, selectedFps());
         } catch (IOException ex) {
+            if (audioStarted) {
+                audioRecorder.stop();
+                audioTmp.delete();
+            }
             JOptionPane.showMessageDialog(this, "创建录像文件失败: " + ex.getMessage(),
                     "错误", JOptionPane.ERROR_MESSAGE);
             return;
         }
+
+        pendingOutputFile = output;
+        pendingVideoFile = videoTmp;
+        pendingAudioFile = audioStarted ? audioTmp : null;
+        pendingAudioLeadMillis = audioStarted
+                ? Math.max(0L, recorder.getStartTimeMillis() - audioRecorder.getStartedAtMillis())
+                : 0L;
+        recordingActive = true;
+        recordError = false;
+
         recordButton.setText("■ 停止录像");
+        recordButton.setStyle(new Color(0x2A1A1F), new Color(0x3B2229), new Color(0x3B2229),
+                Theme.ACCENT, new Color(0x8A3442));
+        recordButton.revalidate();
         deviceCombo.setEnabled(false);
         resolutionCombo.setEnabled(false);
         fpsCombo.setEnabled(false);
+        micCombo.setEnabled(false);
         refreshButton.setEnabled(false);
-        statusLabel.setText("录像中: " + output.getName() + "  |  " + res.width + "x" + res.height
-                + " @ " + selectedFps() + "fps");
+        statusLabel.setText("录像中  →  " + output.getName()
+                + (notice == null ? "" : "  ·  " + notice));
+        infoLabel.setForeground(Theme.ACCENT);
+        preview.setRecording(true);
+        preview.setElapsedSeconds(0);
         startEncoderThread();
         startRecTimer();
     }
 
     private void stopRecording() {
-        if (!recorder.isRecording()) {
+        if (!recordingActive) {
             return;
         }
+        recordingActive = false;
+        finalizing = true;
+        stopRecTimer();
         stopEncoderThread();
-        File output = recorder.getOutputFile();
+
+        final File output = pendingOutputFile;
+        final File video = pendingVideoFile;
+        final File audio = pendingAudioFile;
+        final long audioLead = pendingAudioLeadMillis;
+        final boolean failed = recordError;
+
+        if (audioRecorder.isRecording()) {
+            audioRecorder.stop();
+        }
+        String audioError = audioRecorder.getError();
+
         try {
             recorder.stop();
-            statusLabel.setText("已保存: " + (output == null ? "" : output.getAbsolutePath()));
         } catch (IOException ex) {
-            statusLabel.setText("保存录像失败: " + ex.getMessage());
+            String prefix = audioError == null || audioError.isEmpty() ? "" : audioError + "；";
+            audioError = prefix + "视频收尾失败: " + ex.getMessage();
         }
+        final String audioErrorFinal = audioError;
+
+        pendingOutputFile = null;
+        pendingVideoFile = null;
+        pendingAudioFile = null;
+        pendingAudioLeadMillis = 0L;
+
         finishRecordingUi();
+        recordButton.setEnabled(false);
+        statusLabel.setText("正在保存录像…");
+
+        // 混流会调用外部 ffmpeg，放到后台线程，避免界面卡住
+        Thread worker = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String message = finalizeRecording(output, video, audio,
+                        audioLead, failed, audioErrorFinal);
+                SwingUtilities.invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        finalizing = false;
+                        recordButton.setEnabled(webcam != null && webcam.isOpen());
+                        statusLabel.setText(message);
+                    }
+                });
+            }
+        }, "cama-finalize");
+        worker.setDaemon(false);
+        worker.start();
     }
 
     private void handleRecordError() {
-        if (!recorder.isRecording()) {
+        if (!recordingActive) {
             return;
         }
-        stopEncoderThread();
-        try {
-            recorder.stop();
-        } catch (IOException ignored) {
-            // 已尽力收尾
-        }
-        finishRecordingUi();
-        statusLabel.setText("录像发生错误，已停止并保存可用部分");
+        recordError = true;
+        stopRecording();
     }
 
     private void finishRecordingUi() {
         stopRecTimer();
-        recLabel.setText(" ");
         recordButton.setText("● 开始录像");
+        recordButton.setStyle(Theme.ACCENT, Theme.ACCENT_HOVER, Theme.ACCENT_PRESSED,
+                Color.WHITE, null);
+        recordButton.revalidate();
         deviceCombo.setEnabled(true);
         resolutionCombo.setEnabled(true);
         fpsCombo.setEnabled(true);
+        micCombo.setEnabled(FfmpegMuxer.isAvailable());
         refreshButton.setEnabled(true);
+        infoLabel.setForeground(Theme.FAINT);
+        preview.setRecording(false);
+        updateInfo();
+    }
+
+    /** 停止录制后在后台完成：有音频就混流成 AAC，没有就只清理临时文件。 */
+    private String finalizeRecording(File output, File video, File audio, long audioLeadMillis,
+                                     boolean failed, String audioError) {
+        if (output == null || video == null || !video.isFile()) {
+            return "录像数据缺失，未能保存";
+        }
+        boolean audioReady = audio != null && audio.isFile() && audio.length() > 44;
+        StringBuilder message = new StringBuilder();
+        if (audioReady && FfmpegMuxer.isAvailable()) {
+            try {
+                FfmpegMuxer.mux(video, audio, output, audioLeadMillis);
+                video.delete();
+                audio.delete();
+                message.append("已保存  →  ").append(output.getAbsolutePath());
+            } catch (Exception ex) {
+                message.append(fallbackSave(output, video, audio))
+                        .append("  ·  ").append(ex.getMessage());
+            }
+        } else if (audioReady) {
+            File wavOut = new File(output.getParentFile(),
+                    baseNameWithoutMp4(output.getName()) + ".wav");
+            boolean wavSaved = moveFile(audio, wavOut);
+            message.append(moveFile(video, output)
+                    ? "已保存  →  " + output.getAbsolutePath()
+                    : "视频保存失败");
+            if (wavSaved) {
+                message.append("，音频 → ").append(wavOut.getName());
+            }
+        } else {
+            if (audio != null) {
+                audio.delete();
+            }
+            message.append(moveFile(video, output)
+                    ? "已保存  →  " + output.getAbsolutePath()
+                    : "保存录像失败");
+        }
+        if (failed) {
+            message.insert(0, "录像中断，已保存可用部分  ·  ");
+        }
+        if (audioError != null && !audioError.isEmpty()) {
+            message.append("  ·  音频提示：").append(audioError);
+        }
+        return message.toString();
+    }
+
+    /** 混流失败时尽量保留视频，并把 WAV 一并保存，方便事后手动合成。 */
+    private String fallbackSave(File output, File video, File audio) {
+        File wavOut = new File(output.getParentFile(),
+                baseNameWithoutMp4(output.getName()) + ".wav");
+        boolean wavSaved = moveFile(audio, wavOut);
+        boolean videoSaved = moveFile(video, output);
+        StringBuilder message = new StringBuilder();
+        message.append(videoSaved
+                ? "音频合成失败，已保存视频 → " + output.getName()
+                : "音频合成失败，视频保存失败");
+        if (wavSaved) {
+            message.append("，音频 → ").append(wavOut.getName());
+        }
+        return message.toString();
+    }
+
+    private static String baseNameWithoutMp4(String name) {
+        return name.endsWith(".mp4") ? name.substring(0, name.length() - 4) : name;
+    }
+
+    private static void cleanTempDir(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        long cutoff = System.currentTimeMillis() - 6L * 60L * 60L * 1000L;
+        for (File file : files) {
+            if (file.isFile() && file.lastModified() < cutoff) {
+                file.delete();
+            }
+        }
+    }
+
+    private static boolean moveFile(File from, File to) {
+        if (from == null || to == null || !from.isFile()) {
+            return false;
+        }
+        try {
+            if (to.exists() && !to.delete()) {
+                return false;
+            }
+            if (from.renameTo(to)) {
+                return true;
+            }
+            copyFile(from, to);
+            if (to.length() == from.length()) {
+                from.delete();
+                return true;
+            }
+        } catch (IOException ignored) {
+            // 交给调用方报告失败
+        }
+        return false;
+    }
+
+    private static void copyFile(File from, File to) throws IOException {
+        FileInputStream in = new FileInputStream(from);
+        try {
+            FileOutputStream out = new FileOutputStream(to);
+            try {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = in.read(buffer)) > 0) {
+                    out.write(buffer, 0, read);
+                }
+            } finally {
+                out.close();
+            }
+        } finally {
+            in.close();
+        }
     }
 
     private void startRecTimer() {
         stopRecTimer();
-        recTimer = new Timer(500, e -> {
+        recTimer = new Timer(250, e -> {
+            if (recordingActive && !recorder.isRecording()) {
+                // 编码器异常退出时自动收尾
+                handleRecordError();
+                return;
+            }
             long seconds = recorder.getElapsedSeconds();
-            recLabel.setText(String.format("● REC %02d:%02d", seconds / 60, seconds % 60));
+            preview.setElapsedSeconds(seconds);
+            if (recorder.isRecording()) {
+                infoLabel.setText(String.format("● REC %02d:%02d    ·    %s @ %d fps",
+                        seconds / 60, seconds % 60,
+                        selectedResolution().width + "×" + selectedResolution().height,
+                        selectedFps()));
+            }
         });
         recTimer.start();
     }
@@ -519,7 +939,7 @@ public class CameraFrame extends JFrame {
     }
 
     private void shutdown() {
-        if (recorder.isRecording()) {
+        if (recordingActive) {
             int choice = JOptionPane.showConfirmDialog(this,
                     "正在录像，退出前将停止并保存，是否继续？",
                     "确认退出", JOptionPane.YES_NO_OPTION);

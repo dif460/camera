@@ -73,6 +73,11 @@ public class VideoRecorder {
         return (System.currentTimeMillis() - startTime) / 1000L;
     }
 
+    /** 视频开始编码的时间戳，用于和音频对齐。 */
+    public synchronized long getStartTimeMillis() {
+        return startTime;
+    }
+
     public synchronized long getFrameCount() {
         return frameCount;
     }

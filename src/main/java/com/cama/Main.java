@@ -1,9 +1,9 @@
 package com.cama;
 
 import com.cama.ui.CameraFrame;
+import com.cama.ui.Theme;
 
 import javax.swing.SwingUtilities;
-import javax.swing.UIManager;
 
 public class Main {
 
@@ -14,11 +14,7 @@ public class Main {
         SwingUtilities.invokeLater(new Runnable() {
             @Override
             public void run() {
-                try {
-                    UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-                } catch (Exception ignored) {
-                    // 保持默认外观即可
-                }
+                Theme.install();
                 new CameraFrame().setVisible(true);
             }
         });
