@@ -1,0 +1,4 @@
+out/
+recordings/*.mp4
+.selftest/
+sources.txt
