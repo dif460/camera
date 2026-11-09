@@ -33,12 +33,15 @@ public final class FfmpegMuxer {
         if (cachedCommand != null) {
             return cachedCommand;
         }
-        File base = new File(System.getProperty("user.dir", "."));
-        for (String candidate : LOCAL_CANDIDATES) {
-            File file = new File(base, candidate);
-            if (file.isFile()) {
-                cachedCommand = file.getAbsolutePath();
-                return cachedCommand;
+        // 不能只看当前工作目录：通过快捷方式、IDE 或 javaw 启动时工作目录可能不同。
+        // 依次检查工作目录、class 文件所在目录及其上级（即项目根目录）。
+        for (File base : searchRoots()) {
+            for (String candidate : LOCAL_CANDIDATES) {
+                File file = new File(base, candidate);
+                if (file.isFile()) {
+                    cachedCommand = file.getAbsolutePath();
+                    return cachedCommand;
+                }
             }
         }
         // 尝试 PATH
@@ -62,6 +65,35 @@ public final class FfmpegMuxer {
 
     public static boolean isAvailable() {
         return command() != null;
+    }
+
+    /** ffmpeg 可能所在的目录，按优先级排序并去重。 */
+    private static List<File> searchRoots() {
+        List<File> roots = new ArrayList<File>();
+        addRoot(roots, new File(System.getProperty("user.dir", ".")));
+        try {
+            java.net.URL location = FfmpegMuxer.class.getProtectionDomain()
+                    .getCodeSource().getLocation();
+            File code = new File(location.toURI());
+            File dir = code.isDirectory() ? code : code.getParentFile();
+            if (dir != null) {
+                addRoot(roots, dir);                 // out/
+                addRoot(roots, dir.getParentFile()); // 项目根目录
+            }
+        } catch (Exception ignored) {
+            // 取不到 class 位置时只依赖工作目录
+        }
+        return roots;
+    }
+
+    private static void addRoot(List<File> roots, File dir) {
+        if (dir == null) {
+            return;
+        }
+        File absolute = dir.getAbsoluteFile();
+        if (!roots.contains(absolute)) {
+            roots.add(absolute);
+        }
     }
 
     /**
@@ -122,9 +154,14 @@ public final class FfmpegMuxer {
         reader.setDaemon(true);
         reader.start();
 
+        // 长录像的收尾会慢很多：AAC 编码整条音轨、+faststart 还要重写整个文件。
+        // 按输入体积估算超时，避免几小时的录像在合成阶段被误判为卡死。
+        long bytes = Math.max(0L, video.length()) + Math.max(0L, audio.length());
+        long timeoutSeconds = 120L + bytes / (20L * 1024L * 1024L); // 约 20 MB/s
+
         boolean finished;
         try {
-            finished = process.waitFor(120, TimeUnit.SECONDS);
+            finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             process.destroyForcibly();
@@ -133,7 +170,7 @@ public final class FfmpegMuxer {
         if (!finished) {
             process.destroyForcibly();
             output.delete();
-            throw new IOException("音频合成超时");
+            throw new IOException("音频合成超时（" + timeoutSeconds + " 秒）");
         }
         try {
             reader.join(2000);

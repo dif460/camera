@@ -22,6 +22,13 @@ import java.util.Set;
  */
 public class AudioRecorder {
 
+    /**
+     * WAV（RIFF）的文件长度字段是 32 位无符号数，音频数据最多约 4 GB。
+     * 44.1 kHz / 16 bit 单声道约 12.6 小时，48 kHz 立体声约 6 小时。
+     * 到达上限后备注错误并停止采集，避免写出无法解析的 WAV。
+     */
+    private static final long MAX_WAV_DATA_BYTES = 0xFFFFFFFFL - 36L - 8192L;
+
     /** 采集格式候选，按优先级选择设备支持的第一种。 */
     private static final AudioFormat[] FORMAT_CANDIDATES = {
             new AudioFormat(44100f, 16, 1, true, false),
@@ -201,6 +208,13 @@ public class AudioRecorder {
                 if (read > 0) {
                     raf.write(buffer, 0, read);
                     dataBytes += read;
+                    if (dataBytes >= MAX_WAV_DATA_BYTES) {
+                        if (error == null) {
+                            error = "音频已达 WAV 上限（约 4 GB），之后只录画面";
+                        }
+                        recording = false;
+                        break;
+                    }
                 }
             }
         } catch (Exception ex) {

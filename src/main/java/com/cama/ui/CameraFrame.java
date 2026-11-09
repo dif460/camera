@@ -2,8 +2,10 @@ package com.cama.ui;
 
 import com.cama.recorder.AudioRecorder;
 import com.cama.recorder.FfmpegMuxer;
+import com.cama.recorder.FfmpegVideoRecorder;
 import com.cama.recorder.FrameScaler;
 import com.cama.recorder.VideoRecorder;
+import com.cama.recorder.VideoWriter;
 import com.github.sarxos.webcam.Webcam;
 
 import javax.swing.AbstractAction;
@@ -19,6 +21,8 @@ import javax.swing.JPanel;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import javax.swing.border.EmptyBorder;
+import java.awt.AWTException;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -28,7 +32,13 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.Image;
+import java.awt.MenuItem;
+import java.awt.PopupMenu;
 import java.awt.RenderingHints;
+import java.awt.SystemTray;
+import java.awt.TrayIcon;
+import java.awt.Window;
 import java.awt.event.ActionEvent;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
@@ -60,12 +70,18 @@ public class CameraFrame extends JFrame {
     private final PillButton refreshButton = PillButton.ghost("刷新");
     private final PillButton recordButton = PillButton.accent("● 开始录像");
     private final PillButton folderButton = PillButton.ghost("打开录像目录");
+    private final PillButton hideButton = PillButton.ghost("—");
     private final JLabel statusLabel = Theme.label("就绪", Theme.BASE.deriveFont(12f),
             Theme.MUTED);
     private final JLabel infoLabel = Theme.label("", Theme.BASE.deriveFont(Font.PLAIN, 12f),
             Theme.FAINT);
     private final PreviewPanel preview = new PreviewPanel();
-    private final VideoRecorder recorder = new VideoRecorder();
+    /**
+     * 有 ffmpeg 时用它编码 H.264（兼容性最好，且能和音频合成单文件），
+     * 没有时退回纯 Java 的 JCodec（只能录无声视频）。
+     */
+    private final VideoWriter recorder = FfmpegMuxer.isAvailable()
+            ? new FfmpegVideoRecorder() : new VideoRecorder();
     private final AudioRecorder audioRecorder = new AudioRecorder();
     private final List<AudioRecorder.Device> micDevices = new ArrayList<AudioRecorder.Device>();
     private final File recordingsDir;
@@ -89,9 +105,20 @@ public class CameraFrame extends JFrame {
     private File pendingVideoFile;
     private File pendingAudioFile;
     private long pendingAudioLeadMillis;
+    private TrayIcon trayIcon;
+    private boolean trayAvailable;
+    private boolean trayHintShown;
+    private boolean utilityWindow;
 
     public CameraFrame() {
         super("CAMA · 摄像头录像");
+        // UTILITY 窗口不会出现在任务栏，仍然保留标题栏、最小化与缩放。
+        // 只有确认系统托盘可用时才这么做，否则窗口没有任何入口可以找回。
+        if (SystemTray.isSupported()) {
+            setType(Window.Type.UTILITY);
+            utilityWindow = true;
+        }
+        setIconImage(createAppIcon(64));
         this.recordingsDir = new File(System.getProperty("user.dir"), "recordings");
         if (!recordingsDir.exists()) {
             recordingsDir.mkdirs();
@@ -112,6 +139,9 @@ public class CameraFrame extends JFrame {
         Theme.sizeCombo(fpsCombo, 96, 34);
         Theme.sizeCombo(micCombo, 190, 34);
         micCombo.setToolTipText("录像时使用的麦克风，停止后由 FFmpeg 合成为 AAC 音轨");
+        hideButton.setToolTipText("最小化到托盘");
+        hideButton.setBorder(new EmptyBorder(0, 11, 0, 11));
+        hideButton.addActionListener(e -> minimizeToTray());
         recordButton.setButtonHeight(38);
         recordButton.setToolTipText("开始 / 停止录像（Ctrl+R）");
         resolutionCombo.setSelectedItem("640 x 480");
@@ -157,8 +187,27 @@ public class CameraFrame extends JFrame {
             public void windowClosing(WindowEvent e) {
                 shutdown();
             }
+
+            @Override
+            public void windowIconified(WindowEvent e) {
+                // 点标题栏的最小化按钮时直接收进托盘
+                if (trayAvailable && isVisible()) {
+                    hideToTray();
+                } else if (utilityWindow) {
+                    // 托盘图标注册失败时，UTILITY 窗口没有任务栏入口，
+                    // 真的最小化就找不回来了，直接还原并给出提示
+                    SwingUtilities.invokeLater(new Runnable() {
+                        @Override
+                        public void run() {
+                            setExtendedState(JFrame.NORMAL);
+                            statusLabel.setText("系统托盘不可用，窗口无法最小化");
+                        }
+                    });
+                }
+            }
         });
 
+        installTrayIcon();
         refreshDevices();
     }
 
@@ -214,6 +263,8 @@ public class CameraFrame extends JFrame {
         controls.add(Theme.label("摄像头", Theme.BASE, Theme.MUTED));
         controls.add(deviceCombo);
         controls.add(refreshButton);
+        controls.add(Box.createHorizontalStrut(2));
+        controls.add(hideButton);
 
         header.add(brand, BorderLayout.WEST);
         header.add(controls, BorderLayout.EAST);
@@ -346,6 +397,130 @@ public class CameraFrame extends JFrame {
         return null;
     }
 
+    /** 创建托盘图标和应用图标：深色圆角方块 + 白色圆点，与界面品牌一致。 */
+    private static Image createAppIcon(int size) {
+        BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = image.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setColor(Theme.ACCENT);
+        int arc = Math.round(size * 0.32f);
+        g.fillRoundRect(0, 0, size, size, arc, arc);
+        g.setColor(Color.WHITE);
+        int dot = Math.round(size * 0.30f);
+        int offset = (size - dot) / 2;
+        g.fillOval(offset, offset, dot, dot);
+        g.dispose();
+        return image;
+    }
+
+    private void installTrayIcon() {
+        if (!SystemTray.isSupported()) {
+            trayAvailable = false;
+            return;
+        }
+        PopupMenu menu = new PopupMenu();
+        MenuItem showItem = new MenuItem("显示主界面");
+        showItem.addActionListener(e -> restoreFromTray());
+        MenuItem quitItem = new MenuItem("退出");
+        quitItem.addActionListener(e -> SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                shutdown();
+            }
+        }));
+        menu.add(showItem);
+        menu.addSeparator();
+        menu.add(quitItem);
+
+        TrayIcon icon = new TrayIcon(createAppIcon(32), "CAMA 摄像头录像", menu);
+        icon.setImageAutoSize(true);
+        icon.addActionListener(e -> restoreFromTray());
+        try {
+            SystemTray.getSystemTray().add(icon);
+            trayIcon = icon;
+            trayAvailable = true;
+        } catch (AWTException ex) {
+            trayAvailable = false;
+            trayIcon = null;
+        }
+    }
+
+    /** 最小化按钮：优先收进托盘，没有托盘时退回系统最小化。 */
+    private void minimizeToTray() {
+        if (!trayAvailable) {
+            if (utilityWindow) {
+                statusLabel.setText("系统托盘不可用，无法隐藏窗口");
+                return;
+            }
+            setExtendedState(JFrame.ICONIFIED);
+            return;
+        }
+        hideToTray();
+    }
+
+    private void hideToTray() {
+        if (!isVisible()) {
+            return;
+        }
+        Webcam cameraToClose = null;
+        if (!recordingActive) {
+            // 没在录像时释放摄像头，避免隐藏后摄像头指示灯常亮
+            stopCapture();
+            cameraToClose = webcam;
+            webcam = null;
+            recordButton.setEnabled(false);
+        }
+        setVisible(false);
+        if (!trayHintShown) {
+            trayHintShown = true;
+            trayIcon.displayMessage("CAMA", "已最小化到托盘，双击图标可恢复。",
+                    TrayIcon.MessageType.NONE);
+        }
+        if (cameraToClose != null) {
+            closeWebcamAsync(cameraToClose);
+        }
+    }
+
+    /**
+     * 关闭摄像头可能要在驱动层等待，放在后台线程执行，避免冻结 EDT。
+     * 即便如此它也不会永久阻塞，除非库内部已经被 interrupt 破坏。
+     */
+    private static void closeWebcamAsync(final Webcam cam) {
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    cam.close();
+                } catch (Exception ignored) {
+                    // 关闭失败不影响主流程
+                }
+            }
+        }, "cama-camera-close");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void restoreFromTray() {
+        SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                if (!isVisible()) {
+                    setVisible(true);
+                    // 从标题栏最小化进来的窗口仍带 ICONIFIED 状态，
+                    // 显示之后再清掉，否则恢复出来仍然是缩小的
+                    setExtendedState(JFrame.NORMAL);
+                }
+                toFront();
+                requestFocus();
+                if (webcam == null || !webcam.isOpen()) {
+                    openCamera(deviceCombo.getSelectedIndex());
+                } else if (!capturing) {
+                    startCapture();
+                }
+            }
+        });
+    }
+
     private void openCamera(int index) {
         stopRecording();
         stopCapture();
@@ -455,7 +630,11 @@ public class CameraFrame extends JFrame {
         Thread t = captureThread;
         captureThread = null;
         if (t != null && t != Thread.currentThread()) {
-            t.interrupt();
+            // 这里绝对不能 interrupt：采集线程可能正阻塞在 Webcam.getImage() 里，
+            // 而 sarxos webcam-capture 的 WebcamProcessor 在等任务结果时被打断后，
+            // 那个任务的结果就再也没人取走，处理线程会永久卡在 outbound 队列上，
+            // 之后所有摄像头操作（close/open/getImage）都会永久阻塞。
+            // getImage() 会自己超时返回，等待它自然退出即可。
             try {
                 t.join(1500);
             } catch (InterruptedException e) {
@@ -951,6 +1130,10 @@ public class CameraFrame extends JFrame {
         stopCapture();
         if (webcam != null) {
             webcam.close();
+        }
+        if (trayIcon != null) {
+            SystemTray.getSystemTray().remove(trayIcon);
+            trayIcon = null;
         }
         dispose();
     }

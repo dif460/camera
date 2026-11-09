@@ -8,9 +8,10 @@ import java.io.IOException;
 
 /**
  * 基于 JCodec 的 MP4 录像器，纯 Java 实现，不依赖 FFmpeg。
- * 所有方法均加锁，编码在调用线程（采集线程）中完成。
+ * 作为 {@link FfmpegVideoRecorder} 的兜底方案，仅在找不到 ffmpeg 时使用；
+ * 其产物兼容性一般，音频也无法混入。所有方法均加锁，编码在编码线程中完成。
  */
-public class VideoRecorder {
+public class VideoRecorder implements VideoWriter {
 
     private AWTSequenceEncoder encoder;
     private File outputFile;
